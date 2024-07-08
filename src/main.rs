@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
 
 use cdk::amount::{Amount, SplitTarget};
@@ -7,11 +6,11 @@ use cdk::cdk_database::WalletMemoryDatabase;
 use cdk::nuts::{CurrencyUnit, MintQuoteState};
 use cdk::wallet::Wallet;
 use rand::Rng;
-use tokio::runtime::Runtime;
+use tokio::task::JoinSet;
 use tokio::time::{sleep, Instant};
 
 const SECS_TO_RUN: u64 = 60;
-const WALLET_COUNT: u64 = 16;
+const WALLET_COUNT: u64 = 10;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -51,86 +50,29 @@ async fn main() -> anyhow::Result<()> {
 
     println!("Minted: {}", receive_amount);
 
-    let mut handles = vec![];
+    let mut handles = JoinSet::new();
 
-    let all_satart = Instant::now();
+    let all_start = Instant::now();
 
     for i in 0..WALLET_COUNT {
-        let b = wallet.total_balance().await?;
-
-        println!("{}", b);
         let starting_token = wallet
             .send(Amount::from(100), None, None, &SplitTarget::default())
             .await
             .unwrap();
-        // Clone data to move into the thread
 
         println!("Starting wallet {}", i);
 
-        // Spawn a new OS thread for each wallet
-        let handle = thread::spawn(move || {
-            // Create a new RNG for this thread
-
-            // Create a new Tokio runtime for this thread
-            let rt = Runtime::new().unwrap();
-
-            rt.block_on(async move {
-                let seed = rand::thread_rng().gen::<[u8; 32]>();
-                let wallet = Wallet::new(
-                    &mint_url,
-                    unit,
-                    Arc::new(WalletMemoryDatabase::default()),
-                    &seed,
-                );
-                wallet
-                    .receive(&starting_token, &SplitTarget::default(), &[], &[])
-                    .await
-                    .unwrap();
-
-                let mut transaction_count = 0;
-                let start = Instant::now();
-
-                println!("Starting swapping on wallet {}", i);
-
-                while start.elapsed() < Duration::from_secs(SECS_TO_RUN) {
-                    let mut rng = rand::thread_rng();
-                    let random_number: u8 = rng.gen_range(1..=20);
-                    let token = wallet
-                        .send(
-                            Amount::from(random_number as u64),
-                            None,
-                            None,
-                            &SplitTarget::default(),
-                        )
-                        .await
-                        .unwrap();
-
-                    wallet
-                        .receive(&token.to_string(), &SplitTarget::default(), &[], &[])
-                        .await
-                        .unwrap();
-
-                    transaction_count += 1;
-                }
-
-                transaction_count
-            })
-        });
-
-        handles.push(handle);
+        handles.spawn(wallet_swap(
+            mint_url,
+            CurrencyUnit::Sat,
+            starting_token.clone(),
+        ));
     }
 
-    // Wait for all threads to complete
-    let results: Vec<_> = handles
-        .into_iter()
-        .map(|handle| handle.join().unwrap())
-        .collect();
-
     let mut total_transaction = 0;
-    // Process results
-    for (index, result) in results.into_iter().enumerate() {
+    while let Some(Ok(result)) = handles.join_next().await {
         total_transaction += result;
-        println!("Wallet {} completed {} transaction", index, result);
+        println!("Wallet completed {} transaction", result);
         println!("tps: {}", result / SECS_TO_RUN);
     }
 
@@ -138,8 +80,42 @@ async fn main() -> anyhow::Result<()> {
 
     println!(
         "avg tps: {}",
-        total_transaction / all_satart.elapsed().as_secs()
+        total_transaction / all_start.elapsed().as_secs()
     );
 
     Ok(())
+}
+
+async fn wallet_swap(mint_url: &str, unit: CurrencyUnit, starting_token: String) -> u64 {
+    // Create a new Tokio runtime for this thread
+    let seed = rand::thread_rng().gen::<[u8; 32]>();
+    let wallet = Wallet::new(
+        &mint_url,
+        unit,
+        Arc::new(WalletMemoryDatabase::default()),
+        &seed,
+    );
+    wallet
+        .receive(&starting_token, &SplitTarget::default(), &[], &[])
+        .await
+        .unwrap();
+
+    let mut transaction_count = 0;
+    let start = Instant::now();
+
+    while start.elapsed() < Duration::from_secs(SECS_TO_RUN) {
+        let token = wallet
+            .send(Amount::from(3), None, None, &SplitTarget::default())
+            .await
+            .unwrap();
+
+        wallet
+            .receive(&token.to_string(), &SplitTarget::default(), &[], &[])
+            .await
+            .unwrap();
+
+        transaction_count += 1;
+    }
+
+    transaction_count
 }
